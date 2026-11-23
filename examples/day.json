@@ -1,0 +1,7 @@
+{
+  "channels": [["X", "count"], ["Y", "count"]],
+  "rules": [["X", "count", "μm/s", 2, 14], ["Y", "count", "μm/s", 2, 14]],
+  "initial_events": [["X", "x-1", 7, "recorder/01:1"], ["Y", "y-1", 11, "recorder/01:2"]],
+  "overlap_events": [["X", "x-2", 7, "recorder/02:1"], ["Y", "y-2", 11, "recorder/02:2"]],
+  "replacement_event": ["Y", "y-3", 31, "recorder/03:2"]
+}
