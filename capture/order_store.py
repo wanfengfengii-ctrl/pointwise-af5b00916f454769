@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from capture.requests import CaptureRequest, require_same_request
+from capture.requests import CaptureRequest, RequestConflict, require_same_request
 from device.events import reading_from_row
 from device.take_history import TakeBinding, TakenGroup
 
@@ -29,6 +29,10 @@ _SCHEMA = (
         source TEXT NOT NULL,
         PRIMARY KEY (capture_id, position),
         UNIQUE (capture_id, channel)
+    )''',
+    '''CREATE TABLE IF NOT EXISTS joint_orders (
+        capture_id TEXT PRIMARY KEY REFERENCES capture_orders(capture_id),
+        ports TEXT NOT NULL
     )''',
 )
 
@@ -87,12 +91,23 @@ def load_order(path, capture_id: str) -> CaptureOrder:
         return _require_order(db, capture_id)
 
 
+def _joint_ports(db: sqlite3.Connection, capture_id: str) -> dict | None:
+    row = db.execute(
+        'SELECT ports FROM joint_orders WHERE capture_id = ?', (capture_id,)
+    ).fetchone()
+    return None if row is None else dict(json.loads(row['ports']))
+
+
 def bind_request(path, request: CaptureRequest) -> CaptureOrder:
     binding = request.binding
     with closing(_open(path)) as db, db:
         db.execute('BEGIN IMMEDIATE')
         existing = _read_order(db, request.capture_id)
         if existing is not None:
+            if _joint_ports(db, request.capture_id) is not None:
+                raise RequestConflict(
+                    f'capture ID {request.capture_id!r} belongs to a joint inspection'
+                )
             require_same_request(existing.request, request)
             return existing
         db.execute(
@@ -101,6 +116,57 @@ def bind_request(path, request: CaptureRequest) -> CaptureOrder:
             (request.capture_id, request.shift_id, binding.version_id, json.dumps(binding.generations)),
         )
         return CaptureOrder(request, 'pending')
+
+
+def bind_joint_request(path, request: CaptureRequest, ports_by_channel) -> CaptureOrder | None:
+    """Register a joint order, or return None while another joint order is open."""
+    binding = request.binding
+    with closing(_open(path)) as db, db:
+        db.execute('BEGIN IMMEDIATE')
+        existing = _read_order(db, request.capture_id)
+        if existing is not None:
+            stored = _joint_ports(db, request.capture_id)
+            if stored is None:
+                raise RequestConflict(
+                    f'capture ID {request.capture_id!r} belongs to an ordinary capture'
+                )
+            require_same_request(existing.request, request)
+            if ports_by_channel is not None and stored != ports_by_channel:
+                raise RequestConflict('joint ports differ from the original registration')
+            return existing
+        if ports_by_channel is None:
+            raise ValueError('a new joint inspection requires the station ports')
+        blocker = db.execute(
+            '''SELECT j.capture_id FROM joint_orders AS j
+               JOIN capture_orders AS c USING (capture_id)
+               WHERE c.state != 'invalid'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM signed_captures AS s WHERE s.capture_id = j.capture_id
+                 )
+               LIMIT 1''',
+        ).fetchone()
+        if blocker is not None:
+            return None
+        db.execute(
+            '''INSERT INTO capture_orders (capture_id, shift_id, version_id, generations, state)
+               VALUES (?, ?, ?, ?, 'pending')''',
+            (request.capture_id, request.shift_id, binding.version_id, json.dumps(binding.generations)),
+        )
+        db.execute(
+            'INSERT INTO joint_orders (capture_id, ports) VALUES (?, ?)',
+            (request.capture_id, json.dumps(ports_by_channel, sort_keys=True)),
+        )
+        return CaptureOrder(request, 'pending')
+
+
+def load_joint_order(path, capture_id: str) -> tuple[CaptureOrder, dict]:
+    with closing(_open(path)) as db, db:
+        db.execute('BEGIN')
+        order = _require_order(db, capture_id)
+        ports = _joint_ports(db, capture_id)
+        if ports is None:
+            raise RequestConflict(f'capture ID {capture_id!r} belongs to an ordinary capture')
+        return order, ports
 
 
 def _record_settlement(path, settled: CaptureOrder) -> CaptureOrder:
